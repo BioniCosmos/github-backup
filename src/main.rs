@@ -1,12 +1,15 @@
 use std::env;
 
+use anyhow::anyhow;
 use reqwest::{
-    blocking::Client,
+    Client,
     header::{self, HeaderMap, HeaderValue},
 };
 use serde::Deserialize;
+use tokio::{process::Command, task::JoinSet};
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv()?;
 
     let mut headers = HeaderMap::with_capacity(4);
@@ -29,13 +32,38 @@ fn main() -> anyhow::Result<()> {
     let mut repos = Vec::<Repo>::new();
     let mut url = String::from("https://api.github.com/user/repos");
     while !url.is_empty() {
-        let res = client.get(&url).send()?;
+        let res = client.get(&url).send().await?;
         let next = get_next(res.headers().get("link"));
-        repos.append(&mut res.json()?);
+        repos.append(&mut res.json().await?);
         url = next;
     }
 
-    println!("{repos:#?}");
+    let mut tasks = JoinSet::new();
+    for repo in repos {
+        tasks.spawn(async move {
+            if let Err(e) = Command::new("git")
+                .arg("clone")
+                .arg("--mirror")
+                .arg(repo.clone_url)
+                .output()
+                .await
+                .map_err(anyhow::Error::new)
+                .and_then(|output| match output.status.success() {
+                    true => Ok(()),
+                    false => Err(anyhow!(
+                        String::try_from(output.stderr)
+                            .expect("unexpected invalid stderr")
+                            .trim()
+                            .to_owned()
+                    )),
+                })
+            {
+                eprintln!("Error when fetching {}: {e}", repo.full_name);
+            }
+        });
+    }
+    tasks.join_all().await;
+
     Ok(())
 }
 
