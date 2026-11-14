@@ -1,15 +1,16 @@
 use std::{
+    collections::HashMap,
     env,
     fs::{self, File},
     io::ErrorKind,
-    path::Path,
+    path::PathBuf,
     process::Command,
-    sync::atomic::AtomicUsize,
+    sync::atomic::{AtomicUsize, Ordering},
     thread,
 };
 
 use anyhow::anyhow;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use ureq::{
     Agent, SendBody,
     config::Config,
@@ -49,8 +50,15 @@ fn main() -> anyhow::Result<()> {
         url = next;
     }
 
-    let base_path = env::var("BASE_PATH").unwrap_or("repos".to_owned());
-    fs::create_dir_all(&base_path)?;
+    let mut owners: HashMap<_, Vec<_>> = HashMap::new();
+    for repo in repos.clone() {
+        owners.entry(repo.owner.clone()).or_default().push(repo);
+    }
+
+    let base_path = PathBuf::from(env::var("BASE_PATH").unwrap_or("repos".to_owned()));
+    for owner in &owners {
+        fs::create_dir_all(base_path.join(owner.0))?;
+    }
 
     let i = AtomicUsize::new(0);
     thread::scope(|scope| {
@@ -58,11 +66,12 @@ fn main() -> anyhow::Result<()> {
             scope.spawn(|| {
                 while let Some(Repo {
                     full_name,
+                    name: _,
+                    owner,
                     clone_url,
-                }) = repos.get(i.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                }) = repos.get(i.fetch_add(1, Ordering::Relaxed))
                 {
-                    let repo_path = Path::new(&base_path)
-                        .join(clone_url.split("/").last().expect("unexpected invalid URL"));
+                    let repo_path = base_path.join(format!("{full_name}.git"));
 
                     let is_new =
                         File::open(&repo_path).is_err_and(|e| e.kind() == ErrorKind::NotFound);
@@ -72,7 +81,7 @@ fn main() -> anyhow::Result<()> {
                             .arg("clone")
                             .arg("--mirror")
                             .arg(clone_url)
-                            .current_dir(&base_path)
+                            .current_dir(base_path.join(owner))
                     } else {
                         command
                             .arg("remote")
@@ -101,10 +110,25 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct Repo {
     full_name: String,
+    #[allow(unused)]
+    name: String,
+    #[serde(deserialize_with = "deserialize_owner")]
+    owner: String,
     clone_url: String,
+}
+
+fn deserialize_owner<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Owner {
+        login: String,
+    }
+    Owner::deserialize(deserializer).map(|x| x.login)
 }
 
 fn get_next(raw: Option<&HeaderValue>) -> String {
