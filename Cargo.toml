@@ -9,3 +9,10 @@ dotenvy = "0.15"
 reqwest = { version = "0.13", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = "s"
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1
