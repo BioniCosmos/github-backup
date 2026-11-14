@@ -1,18 +1,20 @@
 use std::{env, fs::File, io::ErrorKind, path::Path, sync::Arc};
 
 use anyhow::anyhow;
-use reqwest::{
-    Client,
-    header::{self, HeaderMap, HeaderValue},
-};
 use serde::Deserialize;
 use tokio::{fs, process::Command, task::JoinSet};
+use ureq::{
+    Agent, SendBody,
+    config::Config,
+    http::{HeaderMap, HeaderValue, Request, header},
+    middleware::MiddlewareNext,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv()?;
 
-    let mut headers = HeaderMap::with_capacity(4);
+    let mut headers = HeaderMap::with_capacity(3);
     headers.insert(
         header::ACCEPT,
         HeaderValue::try_from("application/vnd.github+json")?,
@@ -22,19 +24,22 @@ async fn main() -> anyhow::Result<()> {
         HeaderValue::try_from(format!("Bearer {}", env::var("TOKEN")?))?,
     );
     headers.insert("X-GitHub-Api-Version", HeaderValue::try_from("2026-03-10")?);
-    headers.insert(header::USER_AGENT, HeaderValue::try_from("github-backup")?);
-
-    let client = Client::builder()
-        .default_headers(headers)
-        .user_agent("github-backup")
-        .build()?;
+    let agent = Agent::new_with_config(
+        Config::builder()
+            .user_agent("github-backup")
+            .middleware(move |mut req: Request<SendBody>, next: MiddlewareNext| {
+                *req.headers_mut() = headers.clone();
+                next.handle(req)
+            })
+            .build(),
+    );
 
     let mut repos = Vec::<Repo>::new();
     let mut url = String::from("https://api.github.com/user/repos");
     while !url.is_empty() {
-        let res = client.get(&url).send().await?;
+        let mut res = agent.get(&url).call()?;
         let next = get_next(res.headers().get("link"));
-        repos.append(&mut res.json().await?);
+        repos.append(&mut res.body_mut().read_json()?);
         url = next;
     }
 
