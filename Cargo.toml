@@ -7,7 +7,6 @@ edition = "2024"
 anyhow = "1"
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 
 [profile.release]
