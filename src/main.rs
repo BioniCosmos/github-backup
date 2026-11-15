@@ -5,7 +5,7 @@ use std::{
     io::ErrorKind,
     path::PathBuf,
     process::Command,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread,
 };
 
@@ -65,15 +65,17 @@ fn main() -> anyhow::Result<()> {
         fs::create_dir_all(base_path.join(owner))?;
     }
 
+    let has_err = AtomicBool::new(false);
     let i = AtomicUsize::new(0);
     thread::scope(|scope| {
         for _ in 0..16 {
             scope.spawn(|| {
-                while let Some(Repo {
-                    full_name,
-                    owner,
-                    clone_url,
-                }) = repos.get(i.fetch_add(1, Ordering::Relaxed))
+                while !has_err.load(Ordering::Relaxed)
+                    && let Some(Repo {
+                        full_name,
+                        owner,
+                        clone_url,
+                    }) = repos.get(i.fetch_add(1, Ordering::Relaxed))
                 {
                     let repo_path = base_path.join(format!("{full_name}.git"));
 
@@ -104,6 +106,7 @@ fn main() -> anyhow::Result<()> {
                                 .to_owned()
                         )),
                     }) {
+                        has_err.store(true, Ordering::Relaxed);
                         eprintln!("Error when fetching {}: {e}", full_name);
                     }
                 }
