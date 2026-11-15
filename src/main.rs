@@ -9,17 +9,18 @@ use std::{
     thread,
 };
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use serde::{Deserialize, Deserializer};
 use ureq::{
     Agent, SendBody,
     config::Config,
-    http::{HeaderMap, HeaderValue, Request, header},
+    http::{HeaderMap, HeaderValue, Request, Uri, header, uri::Authority},
     middleware::MiddlewareNext,
 };
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<()> {
     dotenvy::dotenv()?;
+    let token = env::var("TOKEN").expect("failed to read env `TOKEN`");
 
     let mut headers = HeaderMap::with_capacity(3);
     headers.insert(
@@ -28,7 +29,7 @@ fn main() -> anyhow::Result<()> {
     );
     headers.insert(
         header::AUTHORIZATION,
-        HeaderValue::try_from(format!("Bearer {}", env::var("TOKEN")?))?,
+        HeaderValue::try_from(format!("Bearer {token}"))?,
     );
     headers.insert("X-GitHub-Api-Version", HeaderValue::try_from("2026-03-10")?);
     let agent = Agent::new_with_config(
@@ -49,6 +50,7 @@ fn main() -> anyhow::Result<()> {
         repos.append(&mut res.body_mut().read_json()?);
         url = next;
     }
+    add_user_to_url(&agent, &token, &mut repos)?;
 
     let mut owners: HashMap<_, HashSet<_>> = HashMap::new();
     for repo in &repos {
@@ -148,6 +150,11 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct User {
+    login: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct Repo {
     full_name: String,
@@ -160,11 +167,7 @@ fn deserialize_owner<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    struct Owner {
-        login: String,
-    }
-    Owner::deserialize(deserializer).map(|x| x.login)
+    User::deserialize(deserializer).map(|x| x.login)
 }
 
 fn get_next(raw: Option<&HeaderValue>) -> String {
@@ -184,4 +187,28 @@ fn get_next(raw: Option<&HeaderValue>) -> String {
         }
     }
     String::new()
+}
+
+fn add_user_to_url(agent: &Agent, token: &str, repos: &mut Vec<Repo>) -> Result<()> {
+    let user = agent
+        .get("https://api.github.com/user")
+        .call()?
+        .body_mut()
+        .read_json::<User>()?;
+    for repo in repos {
+        let mut parts = Uri::try_from(&repo.clone_url)?.into_parts();
+        parts.authority = Some(Authority::try_from(format!(
+            "{}:{token}@{}",
+            user.login,
+            parts
+                .authority
+                .with_context(|| format!(
+                    "no authority component in `clone_url`: {}",
+                    repo.clone_url
+                ))?
+                .as_str()
+        ))?);
+        repo.clone_url = Uri::from_parts(parts)?.to_string();
+    }
+    Ok(())
 }
