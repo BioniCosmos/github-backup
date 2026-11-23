@@ -3,7 +3,7 @@ use std::{
     env,
     fs::{self, File},
     io::ErrorKind,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread,
@@ -20,8 +20,33 @@ use ureq::{
 
 fn main() -> Result<()> {
     dotenvy::dotenv()?;
-    let token = env::var("TOKEN").expect("failed to read env `TOKEN`");
+    let base_path = PathBuf::from(env::var("BASE_PATH").unwrap_or("repos".to_owned()));
 
+    let args = env::args().collect::<Vec<_>>();
+    if args.len() > 1 {
+        let version = "0.1";
+        let help_message = format!(
+            "GitHub Backup {version}
+
+If there are no arguments, a backup operation will be performed.
+  -l, --list [repo name]/[owner name/repo name]    list the information of one or all repositories
+  -v, --version                                    print the programme version
+  -h, --help                                       print this help message"
+        );
+        match args[1].as_str() {
+            "-l" | "--list" => match args.len() {
+                3 => list_repo(&base_path, &args[2])?,
+                2 => list_all_repos()?,
+                _ => eprintln!("Too many arguments. Try `--help` for more information."),
+            },
+            "-v" | "--version" => println!("GitHub Backup {version}"),
+            "-h" | "--help" => println!("{help_message}"),
+            _ => eprintln!("invalid arguments\n\n{help_message}"),
+        }
+        return Ok(());
+    }
+
+    let token = env::var("TOKEN").expect("failed to read env `TOKEN`");
     let mut headers = HeaderMap::with_capacity(3);
     headers.insert(
         header::ACCEPT,
@@ -62,7 +87,6 @@ fn main() -> Result<()> {
         );
     }
 
-    let base_path = PathBuf::from(env::var("BASE_PATH").unwrap_or("repos".to_owned()));
     for owner in owners.keys() {
         fs::create_dir_all(base_path.join(owner))?;
     }
@@ -211,4 +235,79 @@ fn add_user_to_url(agent: &Agent, token: &str, repos: &mut Vec<Repo>) -> Result<
         repo.clone_url = Uri::from_parts(parts)?.to_string();
     }
     Ok(())
+}
+
+fn list_repo(base_dir: &Path, repo_name: &str) -> Result<()> {
+    let parts = repo_name.split('/').collect::<Vec<_>>();
+    match parts.len() {
+        2 => {
+            let output = Command::new("git")
+                .current_dir(base_dir.join(parts[0]).join(parts[1]).with_extension("git"))
+                .arg("log")
+                .arg("-1")
+                .output()?;
+            if !output.stderr.is_empty() {
+                return Err(anyhow!(
+                    "Encounter error on `git` when listing `{repo_name}`: {}",
+                    String::from_utf8_lossy_owned(output.stderr),
+                ));
+            }
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "Encounter error on `git` when listing `{repo_name}`: `git` exited unexpectedly with {}",
+                    output.status,
+                ));
+            }
+            print!("{}", String::from_utf8_lossy_owned(output.stdout));
+        }
+        1 => {
+            let mut found = vec![];
+            for owner_dir in fs::read_dir(base_dir)? {
+                let owner_dir = owner_dir?;
+                for repo_dir in fs::read_dir(owner_dir.path())? {
+                    let repo_dir = repo_dir?;
+                    if repo_dir.path().with_extension("").file_name().unwrap() == repo_name {
+                        found.push(repo_dir);
+                    }
+                }
+            }
+            if found.is_empty() {
+                return Err(anyhow!("`{repo_name}` not found"));
+            }
+            for repo in found {
+                let output = Command::new("git")
+                    .current_dir(repo.path())
+                    .arg("log")
+                    .arg("-1")
+                    .arg("--pretty=[%h] %an; %ar: %s")
+                    .output()?;
+                if !output.stderr.is_empty() {
+                    return Err(anyhow!(
+                        "Encounter error on `git` when listing `{repo_name}`: {}",
+                        String::from_utf8_lossy_owned(output.stderr),
+                    ));
+                }
+                if !output.status.success() {
+                    return Err(anyhow!(
+                        "Encounter error on `git` when listing `{repo_name}`: `git` exited unexpectedly with {}",
+                        output.status,
+                    ));
+                }
+                print!(
+                    "{} {}",
+                    repo.path()
+                        .strip_prefix(base_dir)?
+                        .with_extension("")
+                        .display(),
+                    String::from_utf8_lossy_owned(output.stdout),
+                );
+            }
+        }
+        _ => return Err(anyhow!("invalid repository name: `{repo_name}`")),
+    }
+    Ok(())
+}
+
+fn list_all_repos() -> Result<()> {
+    todo!()
 }
