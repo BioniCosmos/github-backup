@@ -363,7 +363,9 @@ impl Local {
                 let repo_name = repo
                     .file_name()
                     .into_string()
-                    .map_err(|e| anyhow!("invalid repo directory name: {}", e.display()))?;
+                    .map_err(|e| anyhow!("invalid repo directory name: {}", e.display()))?
+                    .trim_suffix(".git")
+                    .to_owned();
                 let full_name = format!("{owner_name}/{repo_name}");
                 owner_repos.insert(
                     repo_name,
