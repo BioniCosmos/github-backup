@@ -1,8 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    env,
-    fs::{self, File},
-    io::ErrorKind,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -282,32 +280,56 @@ fn list_repo(local: &Local, repo_name: &str) -> Result<()> {
 }
 
 fn list_all_repos(local: &Local) -> Result<()> {
-    for repo in local.flat_sorted() {
-        let output = Command::new("git")
-            .current_dir(&repo.path)
-            .arg("log")
-            .arg("-1")
-            .arg("--pretty=[%h] %an; %ar: %s")
-            .output()?;
-        if !output.stderr.is_empty() {
-            return Err(anyhow!(
-                "Encounter error on `git` when listing `{}`: {}",
-                repo.full_name,
-                String::from_utf8_lossy_owned(output.stderr),
-            ));
+    let repos = local.flat_sorted();
+    let has_err = AtomicBool::default();
+    let i = AtomicUsize::default();
+    let mut result_data = vec![String::new(); repos.len()];
+    let result = SharedPtr(result_data.as_mut_ptr());
+    thread::scope(|scope| {
+        for _ in 0..16 {
+            scope.spawn(|| loop {
+                let i = i.fetch_add(1, Ordering::Relaxed);
+                if i >= repos.len() || has_err.load(Ordering::Relaxed) {
+                    return;
+                }
+                let repo = repos[i];
+                let output = Command::new("git")
+                    .current_dir(&repo.path)
+                    .arg("log")
+                    .arg("-1")
+                    .arg("--pretty=[%h] %an; %ar: %s")
+                    .output()
+                    .unwrap();
+                if !output.stderr.is_empty() {
+                    has_err.store(true, Ordering::Relaxed);
+                    eprintln!(
+                        "Encounter error on `git` when listing `{}`: {}",
+                        String::from_utf8_lossy_owned(output.stderr),
+                        repo.full_name,
+                    );
+                    return;
+                }
+                if !output.status.success() {
+                    has_err.store(true, Ordering::Relaxed);
+                    eprintln!(
+                        "Encounter error on `git` when listing `{}`: `git` exited unexpectedly with {}",
+                        repo.full_name,
+                        output.status,
+                    );
+                    return;
+                }
+                unsafe {
+                    *result.get().add(i) = format!(
+                        "{} {}",
+                        repo.full_name,
+                        String::from_utf8_lossy_owned(output.stdout),
+                    );
+                }
+            });
         }
-        if !output.status.success() {
-            return Err(anyhow!(
-                "Encounter error on `git` when listing `{}`: `git` exited unexpectedly with {}",
-                repo.full_name,
-                output.status,
-            ));
-        }
-        print!(
-            "{} {}",
-            repo.full_name,
-            String::from_utf8_lossy_owned(output.stdout),
-        );
+    });
+    for result in result_data {
+        print!("{result}");
     }
     Ok(())
 }
@@ -378,3 +400,13 @@ impl Local {
         repos
     }
 }
+
+struct SharedPtr<T>(*mut T);
+
+impl<T> SharedPtr<T> {
+    fn get(&self) -> *mut T {
+        self.0
+    }
+}
+
+unsafe impl<T> Sync for SharedPtr<T> {}
