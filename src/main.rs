@@ -3,7 +3,10 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        LazyLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
 };
 
@@ -16,6 +19,37 @@ use ureq::{
     middleware::MiddlewareNext,
 };
 
+static TOKEN: LazyLock<&str> = LazyLock::new(|| {
+    let token = env::var("TOKEN")
+        .expect("failed to read env `TOKEN`")
+        .into_boxed_str();
+    Box::leak(token)
+});
+static HTTP: LazyLock<Agent> = LazyLock::new(|| {
+    let mut headers = HeaderMap::with_capacity(3);
+    headers.insert(
+        header::ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::try_from(format!("Bearer {}", *TOKEN)).expect("invalid token"),
+    );
+    headers.insert(
+        "X-GitHub-Api-Version",
+        HeaderValue::from_static("2026-03-10"),
+    );
+    Agent::new_with_config(
+        Config::builder()
+            .user_agent("github-backup")
+            .middleware(move |mut req: Request<SendBody>, next: MiddlewareNext| {
+                *req.headers_mut() = headers.clone();
+                next.handle(req)
+            })
+            .build(),
+    )
+});
+
 fn main() -> Result<()> {
     dotenvy::dotenv()?;
     let base_path = PathBuf::from(env::var("BASE_PATH").unwrap_or("repos".to_owned()));
@@ -24,18 +58,22 @@ fn main() -> Result<()> {
     let args = env::args().collect::<Vec<_>>();
     if args.len() > 1 {
         let version = "0.1";
-        let help_message = format!(
-            "GitHub Backup {version}
+        let help_message = format!("GitHub Backup {version}
 
 If there are no arguments, a backup operation will be performed.
-  -l, --list [repo name]/[owner name/repo name]    list the information of one or all repositories
-  -v, --version                                    print the programme version
-  -h, --help                                       print this help message"
-        );
+  -l, --list [repo name]/[owner name/repo name]      list the information of one or all local repositories
+  -r, --remote [repo name]/[owner name/repo name]    list the information of one or all remote repositories
+  -v, --version                                      print the programme version
+  -h, --help                                         print this help message");
         match args[1].as_str() {
             "-l" | "--list" => match args.len() {
                 3 => list_repo(&local, &args[2])?,
                 2 => list_all_repos(&local)?,
+                _ => eprintln!("Too many arguments. Try `--help` for more information."),
+            },
+            "-r" | "--remote" => match args.len() {
+                3 => list_remote_repo(&args[2])?,
+                2 => todo!(),
                 _ => eprintln!("Too many arguments. Try `--help` for more information."),
             },
             "-v" | "--version" => println!("GitHub Backup {version}"),
@@ -45,36 +83,15 @@ If there are no arguments, a backup operation will be performed.
         return Ok(());
     }
 
-    let token = env::var("TOKEN").expect("failed to read env `TOKEN`");
-    let mut headers = HeaderMap::with_capacity(3);
-    headers.insert(
-        header::ACCEPT,
-        HeaderValue::try_from("application/vnd.github+json")?,
-    );
-    headers.insert(
-        header::AUTHORIZATION,
-        HeaderValue::try_from(format!("Bearer {token}"))?,
-    );
-    headers.insert("X-GitHub-Api-Version", HeaderValue::try_from("2026-03-10")?);
-    let agent = Agent::new_with_config(
-        Config::builder()
-            .user_agent("github-backup")
-            .middleware(move |mut req: Request<SendBody>, next: MiddlewareNext| {
-                *req.headers_mut() = headers.clone();
-                next.handle(req)
-            })
-            .build(),
-    );
-
     let mut repos = Vec::<Repo>::new();
     let mut url = String::from("https://api.github.com/user/repos");
     while !url.is_empty() {
-        let mut res = agent.get(&url).call()?;
+        let mut res = HTTP.get(&url).call()?;
         let next = get_next(res.headers().get("link"));
         repos.append(&mut res.body_mut().read_json()?);
         url = next;
     }
-    add_user_to_url(&agent, &token, &mut repos)?;
+    add_user_to_url(&mut repos)?;
 
     let mut owners: HashMap<_, HashSet<_>> = HashMap::new();
     for repo in &repos {
@@ -167,6 +184,25 @@ struct Repo {
     clone_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CommitMeta {
+    sha: String,
+    commit: Commit,
+}
+
+#[derive(Debug, Deserialize)]
+struct Commit {
+    author: Author,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Author {
+    name: String,
+    email: String,
+    date: String,
+}
+
 fn deserialize_owner<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -193,8 +229,8 @@ fn get_next(raw: Option<&HeaderValue>) -> String {
     String::new()
 }
 
-fn add_user_to_url(agent: &Agent, token: &str, repos: &mut Vec<Repo>) -> Result<()> {
-    let user = agent
+fn add_user_to_url(repos: &mut Vec<Repo>) -> Result<()> {
+    let user = HTTP
         .get("https://api.github.com/user")
         .call()?
         .body_mut()
@@ -202,8 +238,9 @@ fn add_user_to_url(agent: &Agent, token: &str, repos: &mut Vec<Repo>) -> Result<
     for repo in repos {
         let mut parts = Uri::try_from(&repo.clone_url)?.into_parts();
         parts.authority = Some(Authority::try_from(format!(
-            "{}:{token}@{}",
+            "{}:{}@{}",
             user.login,
+            *TOKEN,
             parts
                 .authority
                 .with_context(|| format!(
@@ -330,6 +367,40 @@ fn list_all_repos(local: &Local) -> Result<()> {
     });
     for result in result_data {
         print!("{result}");
+    }
+    Ok(())
+}
+
+fn list_remote_repo(repo_name: &str) -> Result<()> {
+    let n = repo_name.chars().filter(|&c| c == '/').count();
+    match n {
+        1 => {
+            let CommitMeta {
+                sha,
+                commit:
+                    Commit {
+                        author: Author { name, email, date },
+                        message,
+                    },
+            } = HTTP
+                .get(format!("https://api.github.com/repos/{repo_name}/commits"))
+                .query("per_page", "1")
+                .call()?
+                .body_mut()
+                .read_json::<[CommitMeta; 1]>()?
+                .into_iter()
+                .next()
+                .unwrap();
+            println!(
+                "commit {sha}
+Author: {name} <{email}>
+Date:   {date}\n"
+            );
+            for line in message.lines() {
+                println!("    {line}");
+            }
+        }
+        _ => todo!(),
     }
     Ok(())
 }
