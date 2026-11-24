@@ -80,12 +80,10 @@ If there are no arguments, a backup operation will be performed.
 
     let mut owners: HashMap<_, HashSet<_>> = HashMap::new();
     for repo in &repos {
-        owners.entry(&repo.owner).or_default().insert(
-            repo.clone_url
-                .split('/')
-                .next_back()
-                .with_context(|| format!("invalid `clone_url` on {}", repo.full_name))?,
-        );
+        owners
+            .entry(repo.owner.as_str())
+            .or_default()
+            .insert(repo.name.as_str());
     }
 
     for owner in owners.keys() {
@@ -102,6 +100,7 @@ If there are no arguments, a backup operation will be performed.
                         full_name,
                         owner,
                         clone_url,
+                        ..
                     }) = repos.get(i.fetch_add(1, Ordering::Relaxed))
                 {
                     let repo_path = base_path.join(format!("{full_name}.git"));
@@ -141,34 +140,16 @@ If there are no arguments, a backup operation will be performed.
         }
     });
 
-    for owner_dir in fs::read_dir(&base_path)? {
-        let owner_dir = owner_dir?;
-        let owner_dir_name = owner_dir
-            .file_name()
-            .into_string()
-            .map_err(|e| anyhow!("invalid owner directory name: {}", e.display()))?;
-
-        let Some(repos) = owners
-            .get(&owner_dir_name)
-            .filter(|repos| !repos.is_empty())
-        else {
-            fs::remove_dir_all(owner_dir.path())?;
+    for (owner, repos) in local.0 {
+        if !owners.contains_key(owner.as_str()) {
+            fs::remove_dir_all(base_path.join(owner))?;
             continue;
-        };
-
-        let repo_dirs = fs::read_dir(owner_dir.path())?
-            .map(|x| x.map(|x| x.file_name()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let repo_dir_set = repo_dirs
-            .iter()
-            .map(|x| {
-                x.to_str()
-                    .ok_or_else(|| anyhow!("invalid repository directory name: {}", x.display()))
-            })
-            .collect::<Result<HashSet<_>, _>>()?;
-
-        for repo_dir in repo_dir_set.difference(repos) {
-            fs::remove_dir_all(owner_dir.path().join(repo_dir))?;
+        }
+        let remote_repos = owners.get(owner.as_str()).unwrap();
+        for (repo_name, repo) in repos {
+            if !remote_repos.contains(repo_name.as_str()) {
+                fs::remove_dir_all(&repo.path)?;
+            }
         }
     }
 
@@ -182,6 +163,7 @@ struct User {
 
 #[derive(Clone, Debug, Deserialize)]
 struct Repo {
+    name: String,
     full_name: String,
     #[serde(deserialize_with = "deserialize_owner")]
     owner: String,
