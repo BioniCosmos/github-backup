@@ -21,6 +21,7 @@ use ureq::{
 fn main() -> Result<()> {
     dotenvy::dotenv()?;
     let base_path = PathBuf::from(env::var("BASE_PATH").unwrap_or("repos".to_owned()));
+    let local = Local::new(&base_path)?;
 
     let args = env::args().collect::<Vec<_>>();
     if args.len() > 1 {
@@ -36,7 +37,7 @@ If there are no arguments, a backup operation will be performed.
         match args[1].as_str() {
             "-l" | "--list" => match args.len() {
                 3 => list_repo(&base_path, &args[2])?,
-                2 => list_all_repos()?,
+                2 => list_all_repos(&local)?,
                 _ => eprintln!("Too many arguments. Try `--help` for more information."),
             },
             "-v" | "--version" => println!("GitHub Backup {version}"),
@@ -308,6 +309,82 @@ fn list_repo(base_dir: &Path, repo_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn list_all_repos() -> Result<()> {
-    todo!()
+fn list_all_repos(local: &Local) -> Result<()> {
+    for repo in local.flat_sorted() {
+        let output = Command::new("git")
+            .current_dir(&repo.path)
+            .arg("log")
+            .arg("-1")
+            .arg("--pretty=[%h] %an; %ar: %s")
+            .output()?;
+        if !output.stderr.is_empty() {
+            return Err(anyhow!(
+                "Encounter error on `git` when listing `{}`: {}",
+                repo.full_name,
+                String::from_utf8_lossy_owned(output.stderr),
+            ));
+        }
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Encounter error on `git` when listing `{}`: `git` exited unexpectedly with {}",
+                repo.full_name,
+                output.status,
+            ));
+        }
+        print!(
+            "{} {}",
+            repo.full_name,
+            String::from_utf8_lossy_owned(output.stdout),
+        );
+    }
+    Ok(())
+}
+
+struct Local(HashMap<String, HashMap<String, LocalRepo>>);
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct LocalRepo {
+    path: PathBuf,
+    full_name: String,
+}
+
+impl Local {
+    fn new(base_dir: &Path) -> Result<Self> {
+        let mut repos = HashMap::new();
+        for owner in fs::read_dir(base_dir)? {
+            let owner = owner?;
+            let owner_name = owner
+                .file_name()
+                .into_string()
+                .map_err(|e| anyhow!("invalid owner directory name: {}", e.display()))?;
+            let mut owner_repos = HashMap::new();
+            for repo in fs::read_dir(owner.path())? {
+                let repo = repo?;
+                let repo_name = repo
+                    .file_name()
+                    .into_string()
+                    .map_err(|e| anyhow!("invalid repo directory name: {}", e.display()))?;
+                let full_name = format!("{owner_name}/{repo_name}");
+                owner_repos.insert(
+                    repo_name,
+                    LocalRepo {
+                        path: repo.path(),
+                        full_name,
+                    },
+                );
+            }
+            repos.insert(owner_name, owner_repos);
+        }
+        Ok(Self(repos))
+    }
+
+    fn flat_sorted(&self) -> Vec<&LocalRepo> {
+        let mut repos = self
+            .0
+            .values()
+            .flat_map(|repos| repos.values())
+            .collect::<Vec<_>>();
+        repos.sort();
+        repos
+    }
 }
