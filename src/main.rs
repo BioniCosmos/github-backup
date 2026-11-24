@@ -36,7 +36,7 @@ If there are no arguments, a backup operation will be performed.
         );
         match args[1].as_str() {
             "-l" | "--list" => match args.len() {
-                3 => list_repo(&base_path, &args[2])?,
+                3 => list_repo(&local, &args[2])?,
                 2 => list_all_repos(&local)?,
                 _ => eprintln!("Too many arguments. Try `--help` for more information."),
             },
@@ -238,12 +238,15 @@ fn add_user_to_url(agent: &Agent, token: &str, repos: &mut Vec<Repo>) -> Result<
     Ok(())
 }
 
-fn list_repo(base_dir: &Path, repo_name: &str) -> Result<()> {
+fn list_repo(local: &Local, repo_name: &str) -> Result<()> {
     let parts = repo_name.split('/').collect::<Vec<_>>();
     match parts.len() {
         2 => {
+            let Some(repo) = local.query_with_full_name(parts[0], parts[1]) else {
+                return Err(anyhow!("`{repo_name}` not found"));
+            };
             let output = Command::new("git")
-                .current_dir(base_dir.join(parts[0]).join(parts[1]).with_extension("git"))
+                .current_dir(&repo.path)
                 .arg("log")
                 .arg("-1")
                 .output()?;
@@ -262,22 +265,13 @@ fn list_repo(base_dir: &Path, repo_name: &str) -> Result<()> {
             print!("{}", String::from_utf8_lossy_owned(output.stdout));
         }
         1 => {
-            let mut found = vec![];
-            for owner_dir in fs::read_dir(base_dir)? {
-                let owner_dir = owner_dir?;
-                for repo_dir in fs::read_dir(owner_dir.path())? {
-                    let repo_dir = repo_dir?;
-                    if repo_dir.path().with_extension("").file_name().unwrap() == repo_name {
-                        found.push(repo_dir);
-                    }
-                }
-            }
-            if found.is_empty() {
+            let repos = local.query_with_name(repo_name);
+            if repos.is_empty() {
                 return Err(anyhow!("`{repo_name}` not found"));
             }
-            for repo in found {
+            for repo in repos {
                 let output = Command::new("git")
-                    .current_dir(repo.path())
+                    .current_dir(&repo.path)
                     .arg("log")
                     .arg("-1")
                     .arg("--pretty=[%h] %an; %ar: %s")
@@ -296,10 +290,7 @@ fn list_repo(base_dir: &Path, repo_name: &str) -> Result<()> {
                 }
                 print!(
                     "{} {}",
-                    repo.path()
-                        .strip_prefix(base_dir)?
-                        .with_extension("")
-                        .display(),
+                    repo.full_name,
                     String::from_utf8_lossy_owned(output.stdout),
                 );
             }
@@ -378,6 +369,22 @@ impl Local {
             repos.insert(owner_name, owner_repos);
         }
         Ok(Self(repos))
+    }
+
+    fn query_with_full_name(&self, owner: &str, repo: &str) -> Option<&LocalRepo> {
+        self.0.get(owner).and_then(|repos| repos.get(repo))
+    }
+
+    fn query_with_name(&self, repo_name: &str) -> Vec<&LocalRepo> {
+        self.0
+            .values()
+            .flat_map(|repos| {
+                repos
+                    .iter()
+                    .filter(|&(name, _)| name == repo_name)
+                    .map(|(_, repo)| repo)
+            })
+            .collect()
     }
 
     fn flat_sorted(&self) -> Vec<&LocalRepo> {
