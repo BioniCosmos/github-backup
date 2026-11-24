@@ -97,16 +97,15 @@ If there are no arguments, a backup operation will be performed.
             scope.spawn(|| {
                 while !has_err.load(Ordering::Relaxed)
                     && let Some(Repo {
+                        name,
                         full_name,
                         owner,
                         clone_url,
-                        ..
                     }) = repos.get(i.fetch_add(1, Ordering::Relaxed))
                 {
                     let repo_path = base_path.join(format!("{full_name}.git"));
 
-                    let is_new =
-                        File::open(&repo_path).is_err_and(|e| e.kind() == ErrorKind::NotFound);
+                    let is_new = local.query_with_full_name(owner, name).is_some();
                     let mut command = Command::new("git");
                     if let Err(e) = if is_new {
                         command
