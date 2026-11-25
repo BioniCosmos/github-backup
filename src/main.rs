@@ -1,10 +1,16 @@
 use std::{
     cell::OnceCell,
     collections::HashMap,
-    env, fs,
+    env,
+    fmt::Debug,
+    fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Sender},
+    },
     thread,
 };
 
@@ -175,7 +181,7 @@ fn backup(ctx: &Context) -> Result<()> {
                 {
                     let repo_path = base_dir.join(format!("{full_name}.git"));
 
-                    let is_new = local.query_with_full_name(owner, name).is_some();
+                    let is_new = local.query_by_full_name(owner, name).is_some();
                     let mut command = Command::new("git");
                     if let Err(e) = if is_new {
                         command
@@ -229,7 +235,7 @@ fn list_repo(ctx: &Context, repo_name: &str) -> Result<()> {
     let parts = repo_name.split('/').collect::<Vec<_>>();
     match parts.len() {
         2 => {
-            let Some(repo) = ctx.local().query_with_full_name(parts[0], parts[1]) else {
+            let Some(repo) = ctx.local().query_by_full_name(parts[0], parts[1]) else {
                 return Err(anyhow!("`{repo_name}` not found"));
             };
             let output = Command::new("git")
@@ -252,7 +258,7 @@ fn list_repo(ctx: &Context, repo_name: &str) -> Result<()> {
             print!("{}", String::from_utf8_lossy_owned(output.stdout));
         }
         1 => {
-            let repos = ctx.local().query_with_name(repo_name);
+            let repos = ctx.local().query_by_name(repo_name);
             if repos.is_empty() {
                 return Err(anyhow!("`{repo_name}` not found"));
             }
@@ -372,6 +378,43 @@ Date:   {date}\n"
                 println!("    {line}");
             }
         }
+        0 => {
+            let http = ctx.http();
+            let repos = ctx.remote().query_by_name(repo_name);
+            let latest_commits = Task::scope(|scope| {
+                for repo in &repos {
+                    scope.run(|| {
+                        Ok(http
+                            .get(format!(
+                                "https://api.github.com/repos/{}/commits",
+                                repo.full_name
+                            ))
+                            .query("per_page", "1")
+                            .call()?
+                            .body_mut()
+                            .read_json::<[CommitMeta; 1]>()?
+                            .into_iter()
+                            .next()
+                            .unwrap())
+                    });
+                }
+            })?;
+            for (
+                CommitMeta {
+                    sha,
+                    commit: Commit { author, message },
+                },
+                RemoteRepo { full_name, .. },
+            ) in latest_commits.into_iter().zip(repos)
+            {
+                println!(
+                    "{full_name} [{sha}] {}; {}: {}",
+                    author.name,
+                    author.date,
+                    message.lines().next().unwrap_or_default(),
+                );
+            }
+        }
         _ => todo!(),
     }
     Ok(())
@@ -417,11 +460,11 @@ impl Local {
         Ok(Self(repos))
     }
 
-    fn query_with_full_name(&self, owner: &str, repo: &str) -> Option<&LocalRepo> {
+    fn query_by_full_name(&self, owner: &str, repo: &str) -> Option<&LocalRepo> {
         self.0.get(owner).and_then(|repos| repos.get(repo))
     }
 
-    fn query_with_name(&self, repo_name: &str) -> Vec<&LocalRepo> {
+    fn query_by_name(&self, repo_name: &str) -> Vec<&LocalRepo> {
         self.0
             .values()
             .flat_map(|repos| {
@@ -466,6 +509,13 @@ impl Remote {
                 .insert(repo.name.clone(), repo);
         }
         Ok(Self(owners))
+    }
+
+    fn query_by_name(&self, repo_name: &str) -> Vec<&RemoteRepo> {
+        self.0
+            .values()
+            .flat_map(|repos| repos.values().filter(|repo| repo.name == repo_name))
+            .collect()
     }
 
     fn flat(&self) -> Vec<&RemoteRepo> {
@@ -522,3 +572,43 @@ impl<T> SharedPtr<T> {
 }
 
 unsafe impl<T> Sync for SharedPtr<T> {}
+
+struct Task<'scope, T: 'scope> {
+    tx: Sender<Box<dyn FnOnce() -> Result<T> + 'scope + Send>>,
+}
+
+impl<'scope, T: Send> Task<'scope, T> {
+    fn scope(f: impl for<'s> FnOnce(&'s Self)) -> Result<Vec<T>> {
+        let (tx, rx) = mpsc::channel();
+        let task_scope = Self { tx };
+        let err = OnceLock::new();
+        thread::scope(|scope| {
+            let rx_worker = scope.spawn(|| {
+                rx.into_iter()
+                    .map(|task| {
+                        scope.spawn(|| {
+                            if err.get().is_some() {
+                                return Err(anyhow!(""));
+                            }
+                            task().inspect_err(|_| _ = err.set(()))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            f(&task_scope);
+            drop(task_scope.tx);
+            rx_worker
+                .join()
+                .unwrap()
+                .into_iter()
+                .map(|task| task.join().unwrap())
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .collect()
+    }
+
+    fn run(&self, f: impl FnOnce() -> Result<T> + 'scope + Send) {
+        self.tx.send(Box::new(f)).unwrap();
+    }
+}
