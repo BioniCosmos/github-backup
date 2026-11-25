@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -83,91 +83,8 @@ If there are no arguments, a backup operation will be performed.
         return Ok(());
     }
 
-    let mut repos = Vec::<Repo>::new();
-    let mut url = String::from("https://api.github.com/user/repos");
-    while !url.is_empty() {
-        let mut res = HTTP.get(&url).call()?;
-        let next = get_next(res.headers().get("link"));
-        repos.append(&mut res.body_mut().read_json()?);
-        url = next;
-    }
-    add_user_to_url(&mut repos)?;
-
-    let mut owners: HashMap<_, HashSet<_>> = HashMap::new();
-    for repo in &repos {
-        owners
-            .entry(repo.owner.as_str())
-            .or_default()
-            .insert(repo.name.as_str());
-    }
-
-    for owner in owners.keys() {
-        fs::create_dir_all(base_path.join(owner))?;
-    }
-
-    let has_err = AtomicBool::new(false);
-    let i = AtomicUsize::new(0);
-    thread::scope(|scope| {
-        for _ in 0..16 {
-            scope.spawn(|| {
-                while !has_err.load(Ordering::Relaxed)
-                    && let Some(Repo {
-                        name,
-                        full_name,
-                        owner,
-                        clone_url,
-                    }) = repos.get(i.fetch_add(1, Ordering::Relaxed))
-                {
-                    let repo_path = base_path.join(format!("{full_name}.git"));
-
-                    let is_new = local.query_with_full_name(owner, name).is_some();
-                    let mut command = Command::new("git");
-                    if let Err(e) = if is_new {
-                        command
-                            .arg("clone")
-                            .arg("--mirror")
-                            .arg(clone_url)
-                            .current_dir(base_path.join(owner))
-                    } else {
-                        command
-                            .arg("remote")
-                            .arg("update")
-                            .arg("--prune")
-                            .current_dir(&repo_path)
-                    }
-                    .output()
-                    .map_err(anyhow::Error::new)
-                    .and_then(|output| match output.status.success() {
-                        true => Ok(()),
-                        false => Err(anyhow!(
-                            String::try_from(output.stderr)
-                                .expect("unexpected invalid stderr")
-                                .trim()
-                                .to_owned()
-                        )),
-                    }) {
-                        has_err.store(true, Ordering::Relaxed);
-                        eprintln!("Error when fetching {}: {e}", full_name);
-                    }
-                }
-            });
-        }
-    });
-
-    for (owner, repos) in local.0 {
-        if !owners.contains_key(owner.as_str()) {
-            fs::remove_dir_all(base_path.join(owner))?;
-            continue;
-        }
-        let remote_repos = owners.get(owner.as_str()).unwrap();
-        for (repo_name, repo) in repos {
-            if !remote_repos.contains(repo_name.as_str()) {
-                fs::remove_dir_all(&repo.path)?;
-            }
-        }
-    }
-
-    Ok(())
+    let remote = Remote::new(&HTTP, &TOKEN)?;
+    backup(&remote, &base_path, &local)
 }
 
 #[derive(Deserialize)]
@@ -176,7 +93,7 @@ struct User {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct Repo {
+struct RemoteRepo {
     name: String,
     full_name: String,
     #[serde(deserialize_with = "deserialize_owner")]
@@ -210,47 +127,74 @@ where
     User::deserialize(deserializer).map(|x| x.login)
 }
 
-fn get_next(raw: Option<&HeaderValue>) -> String {
-    if let Some(raw) = raw
-        && let Ok(raw) = raw.to_str()
-    {
-        for item in raw.split(", ") {
-            let mut item = item.split("; ");
-            let url = item.next().map(|url| &url[1..url.len() - 1]);
-            let rel = item.next().map(|rel| &rel[5..rel.len() - 1]);
-            if let Some(url) = url
-                && let Some(rel) = rel
-                && rel == "next"
-            {
-                return url.to_owned();
+fn backup(remote: &Remote, base_dir: &Path, local: &Local) -> Result<()> {
+    for owner in remote.0.keys() {
+        fs::create_dir_all(base_dir.join(owner))?;
+    }
+
+    let repos = remote.flat();
+    let has_err = AtomicBool::new(false);
+    let i = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..16 {
+            scope.spawn(|| {
+                while !has_err.load(Ordering::Relaxed)
+                    && let Some(RemoteRepo {
+                        name,
+                        full_name,
+                        owner,
+                        clone_url,
+                    }) = repos.get(i.fetch_add(1, Ordering::Relaxed))
+                {
+                    let repo_path = base_dir.join(format!("{full_name}.git"));
+
+                    let is_new = local.query_with_full_name(owner, name).is_some();
+                    let mut command = Command::new("git");
+                    if let Err(e) = if is_new {
+                        command
+                            .arg("clone")
+                            .arg("--mirror")
+                            .arg(clone_url)
+                            .current_dir(base_dir.join(owner))
+                    } else {
+                        command
+                            .arg("remote")
+                            .arg("update")
+                            .arg("--prune")
+                            .current_dir(&repo_path)
+                    }
+                    .output()
+                    .map_err(anyhow::Error::new)
+                    .and_then(|output| match output.status.success() {
+                        true => Ok(()),
+                        false => Err(anyhow!(
+                            String::try_from(output.stderr)
+                                .expect("unexpected invalid stderr")
+                                .trim()
+                                .to_owned()
+                        )),
+                    }) {
+                        has_err.store(true, Ordering::Relaxed);
+                        eprintln!("Error when fetching {}: {e}", full_name);
+                    }
+                }
+            });
+        }
+    });
+
+    for (owner, repos) in &local.0 {
+        if !remote.0.contains_key(owner) {
+            fs::remove_dir_all(base_dir.join(owner))?;
+            continue;
+        }
+        let remote_repos = remote.0.get(owner).unwrap();
+        for (repo_name, repo) in repos {
+            if !remote_repos.contains_key(repo_name) {
+                fs::remove_dir_all(&repo.path)?;
             }
         }
     }
-    String::new()
-}
 
-fn add_user_to_url(repos: &mut Vec<Repo>) -> Result<()> {
-    let user = HTTP
-        .get("https://api.github.com/user")
-        .call()?
-        .body_mut()
-        .read_json::<User>()?;
-    for repo in repos {
-        let mut parts = Uri::try_from(&repo.clone_url)?.into_parts();
-        parts.authority = Some(Authority::try_from(format!(
-            "{}:{}@{}",
-            user.login,
-            *TOKEN,
-            parts
-                .authority
-                .with_context(|| format!(
-                    "no authority component in `clone_url`: {}",
-                    repo.clone_url
-                ))?
-                .as_str()
-        ))?);
-        repo.clone_url = Uri::from_parts(parts)?.to_string();
-    }
     Ok(())
 }
 
@@ -469,6 +413,75 @@ impl Local {
             .collect::<Vec<_>>();
         repos.sort();
         repos
+    }
+}
+
+struct Remote(HashMap<String, HashMap<String, RemoteRepo>>);
+
+impl Remote {
+    fn new(http: &Agent, token: &str) -> Result<Self> {
+        let mut repos = vec![];
+        let mut url = "https://api.github.com/user/repos";
+        let mut res;
+        while !url.is_empty() {
+            res = HTTP.get(url).call()?;
+            repos.append(&mut res.body_mut().read_json()?);
+            url = Self::next_page(res.headers().get("link"));
+        }
+        Self::add_user_info_to_url(http, token, &mut repos)?;
+
+        let mut owners = HashMap::new();
+        for repo in repos {
+            owners
+                .entry(repo.owner.clone())
+                .or_insert_with(|| HashMap::new())
+                .insert(repo.name.clone(), repo);
+        }
+        Ok(Self(owners))
+    }
+
+    fn flat(&self) -> Vec<&RemoteRepo> {
+        self.0.values().flat_map(|owner| owner.values()).collect()
+    }
+
+    fn next_page(raw: Option<&HeaderValue>) -> &str {
+        if let Some(raw) = raw
+            && let Ok(raw) = raw.to_str()
+        {
+            for item in raw.split(", ") {
+                let mut item = item.split("; ");
+                let url = item.next().map(|url| &url[1..url.len() - 1]);
+                let rel = item.next().map(|rel| &rel[5..rel.len() - 1]);
+                if let Some(url) = url
+                    && let Some(rel) = rel
+                    && rel == "next"
+                {
+                    return url;
+                }
+            }
+        }
+        ""
+    }
+
+    fn add_user_info_to_url(http: &Agent, token: &str, repos: &mut Vec<RemoteRepo>) -> Result<()> {
+        let user = http
+            .get("https://api.github.com/user")
+            .call()?
+            .body_mut()
+            .read_json::<User>()?;
+        for repo in repos {
+            let mut parts = Uri::try_from(&repo.clone_url)?.into_parts();
+            parts.authority = Some(Authority::try_from(format!(
+                "{}:{token}@{}",
+                user.login,
+                parts.authority.with_context(|| format!(
+                    "no authority component in `clone_url`: {}",
+                    repo.clone_url,
+                ))?,
+            ))?);
+            repo.clone_url = Uri::from_parts(parts)?.to_string();
+        }
+        Ok(())
     }
 }
 
