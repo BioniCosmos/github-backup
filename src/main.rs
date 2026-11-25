@@ -1,12 +1,10 @@
 use std::{
+    cell::OnceCell,
     collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        LazyLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread,
 };
 
@@ -19,72 +17,98 @@ use ureq::{
     middleware::MiddlewareNext,
 };
 
-static TOKEN: LazyLock<&str> = LazyLock::new(|| {
-    let token = env::var("TOKEN")
-        .expect("failed to read env `TOKEN`")
-        .into_boxed_str();
-    Box::leak(token)
-});
-static HTTP: LazyLock<Agent> = LazyLock::new(|| {
-    let mut headers = HeaderMap::with_capacity(3);
-    headers.insert(
-        header::ACCEPT,
-        HeaderValue::from_static("application/vnd.github+json"),
-    );
-    headers.insert(
-        header::AUTHORIZATION,
-        HeaderValue::try_from(format!("Bearer {}", *TOKEN)).expect("invalid token"),
-    );
-    headers.insert(
-        "X-GitHub-Api-Version",
-        HeaderValue::from_static("2026-03-10"),
-    );
-    Agent::new_with_config(
-        Config::builder()
-            .user_agent("github-backup")
-            .middleware(move |mut req: Request<SendBody>, next: MiddlewareNext| {
-                *req.headers_mut() = headers.clone();
-                next.handle(req)
-            })
-            .build(),
-    )
-});
+#[derive(Default)]
+struct Context {
+    base_dir: OnceCell<PathBuf>,
+    token: OnceCell<String>,
+    local: OnceCell<Local>,
+    remote: OnceCell<Remote>,
+    http: OnceCell<Agent>,
+}
 
-fn main() -> Result<()> {
-    dotenvy::dotenv()?;
-    let base_path = PathBuf::from(env::var("BASE_PATH").unwrap_or("repos".to_owned()));
-    let local = Local::new(&base_path)?;
+impl Context {
+    fn base_dir(&self) -> &Path {
+        self.base_dir.get_or_init(|| {
+            PathBuf::from(dotenvy::var("STATE_DIRECTORY").unwrap_or_default()).join("repos")
+        })
+    }
 
-    let args = env::args().collect::<Vec<_>>();
-    if args.len() > 1 {
-        let version = "0.1";
-        let help_message = format!("GitHub Backup {version}
+    fn token(&self) -> &str {
+        self.token
+            .get_or_init(|| dotenvy::var("TOKEN").expect("failed to read env `TOKEN`"))
+    }
 
+    fn local(&self) -> &Local {
+        self.local
+            .get_or_init(|| Local::new(self.base_dir()).expect("failed to initialize `local`"))
+    }
+
+    fn remote(&self) -> &Remote {
+        self.remote.get_or_init(|| {
+            Remote::new(self.http(), self.token()).expect("failed to initialize `remote`")
+        })
+    }
+
+    fn http(&self) -> &Agent {
+        self.http.get_or_init(|| {
+            let mut headers = HeaderMap::with_capacity(3);
+            headers.insert(
+                header::ACCEPT,
+                HeaderValue::from_static("application/vnd.github+json"),
+            );
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::try_from(format!("Bearer {}", self.token())).expect("invalid token"),
+            );
+            headers.insert(
+                "X-GitHub-Api-Version",
+                HeaderValue::from_static("2026-03-10"),
+            );
+            Agent::new_with_config(
+                Config::builder()
+                    .user_agent("github-backup")
+                    .middleware(move |mut req: Request<SendBody>, next: MiddlewareNext| {
+                        *req.headers_mut() = headers.clone();
+                        next.handle(req)
+                    })
+                    .build(),
+            )
+        })
+    }
+}
+
+#[rustfmt::skip]
+macro_rules! version { () => { "0.1" }; }
+const HELP_MESSAGE: &str = concat!("GitHub Backup ", version!(), "\n
 If there are no arguments, a backup operation will be performed.
   -l, --list [repo name]/[owner name/repo name]      list the information of one or all local repositories
   -r, --remote [repo name]/[owner name/repo name]    list the information of one or all remote repositories
   -v, --version                                      print the programme version
   -h, --help                                         print this help message");
+
+fn main() -> Result<()> {
+    let ctx = Context::default();
+    let args = env::args().collect::<Vec<_>>();
+    if args.len() > 1 {
         match args[1].as_str() {
             "-l" | "--list" => match args.len() {
-                3 => list_repo(&local, &args[2])?,
-                2 => list_all_repos(&local)?,
+                3 => list_repo(&ctx, &args[2])?,
+                2 => list_all_repos(&ctx)?,
                 _ => eprintln!("Too many arguments. Try `--help` for more information."),
             },
             "-r" | "--remote" => match args.len() {
-                3 => list_remote_repo(&args[2])?,
+                3 => list_remote_repo(&ctx, &args[2])?,
                 2 => todo!(),
                 _ => eprintln!("Too many arguments. Try `--help` for more information."),
             },
-            "-v" | "--version" => println!("GitHub Backup {version}"),
-            "-h" | "--help" => println!("{help_message}"),
-            _ => eprintln!("invalid arguments\n\n{help_message}"),
+            "-v" | "--version" => println!("GitHub Backup {}", version!()),
+            "-h" | "--help" => println!("{HELP_MESSAGE}"),
+            _ => eprintln!("invalid arguments\n\n{HELP_MESSAGE}"),
         }
-        return Ok(());
+    } else {
+        backup(&ctx)?;
     }
-
-    let remote = Remote::new(&HTTP, &TOKEN)?;
-    backup(&remote, &base_path, &local)
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -127,12 +151,15 @@ where
     User::deserialize(deserializer).map(|x| x.login)
 }
 
-fn backup(remote: &Remote, base_dir: &Path, local: &Local) -> Result<()> {
-    for owner in remote.0.keys() {
+fn backup(ctx: &Context) -> Result<()> {
+    let base_dir = ctx.base_dir();
+    let local = ctx.local();
+
+    for owner in ctx.remote().0.keys() {
         fs::create_dir_all(base_dir.join(owner))?;
     }
 
-    let repos = remote.flat();
+    let repos = ctx.remote().flat();
     let has_err = AtomicBool::new(false);
     let i = AtomicUsize::new(0);
     thread::scope(|scope| {
@@ -183,11 +210,11 @@ fn backup(remote: &Remote, base_dir: &Path, local: &Local) -> Result<()> {
     });
 
     for (owner, repos) in &local.0 {
-        if !remote.0.contains_key(owner) {
+        if !ctx.remote().0.contains_key(owner) {
             fs::remove_dir_all(base_dir.join(owner))?;
             continue;
         }
-        let remote_repos = remote.0.get(owner).unwrap();
+        let remote_repos = ctx.remote().0.get(owner).unwrap();
         for (repo_name, repo) in repos {
             if !remote_repos.contains_key(repo_name) {
                 fs::remove_dir_all(&repo.path)?;
@@ -198,11 +225,11 @@ fn backup(remote: &Remote, base_dir: &Path, local: &Local) -> Result<()> {
     Ok(())
 }
 
-fn list_repo(local: &Local, repo_name: &str) -> Result<()> {
+fn list_repo(ctx: &Context, repo_name: &str) -> Result<()> {
     let parts = repo_name.split('/').collect::<Vec<_>>();
     match parts.len() {
         2 => {
-            let Some(repo) = local.query_with_full_name(parts[0], parts[1]) else {
+            let Some(repo) = ctx.local().query_with_full_name(parts[0], parts[1]) else {
                 return Err(anyhow!("`{repo_name}` not found"));
             };
             let output = Command::new("git")
@@ -225,7 +252,7 @@ fn list_repo(local: &Local, repo_name: &str) -> Result<()> {
             print!("{}", String::from_utf8_lossy_owned(output.stdout));
         }
         1 => {
-            let repos = local.query_with_name(repo_name);
+            let repos = ctx.local().query_with_name(repo_name);
             if repos.is_empty() {
                 return Err(anyhow!("`{repo_name}` not found"));
             }
@@ -260,8 +287,8 @@ fn list_repo(local: &Local, repo_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn list_all_repos(local: &Local) -> Result<()> {
-    let repos = local.flat_sorted();
+fn list_all_repos(ctx: &Context) -> Result<()> {
+    let repos = ctx.local().flat_sorted();
     let has_err = AtomicBool::default();
     let i = AtomicUsize::default();
     let mut result_data = vec![String::new(); repos.len()];
@@ -315,7 +342,7 @@ fn list_all_repos(local: &Local) -> Result<()> {
     Ok(())
 }
 
-fn list_remote_repo(repo_name: &str) -> Result<()> {
+fn list_remote_repo(ctx: &Context, repo_name: &str) -> Result<()> {
     let n = repo_name.chars().filter(|&c| c == '/').count();
     match n {
         1 => {
@@ -326,7 +353,8 @@ fn list_remote_repo(repo_name: &str) -> Result<()> {
                         author: Author { name, email, date },
                         message,
                     },
-            } = HTTP
+            } = ctx
+                .http()
                 .get(format!("https://api.github.com/repos/{repo_name}/commits"))
                 .query("per_page", "1")
                 .call()?
@@ -424,7 +452,7 @@ impl Remote {
         let mut url = "https://api.github.com/user/repos";
         let mut res;
         while !url.is_empty() {
-            res = HTTP.get(url).call()?;
+            res = http.get(url).call()?;
             repos.append(&mut res.body_mut().read_json()?);
             url = Self::next_page(res.headers().get("link"));
         }
@@ -434,7 +462,7 @@ impl Remote {
         for repo in repos {
             owners
                 .entry(repo.owner.clone())
-                .or_insert_with(|| HashMap::new())
+                .or_insert_with(HashMap::new)
                 .insert(repo.name.clone(), repo);
         }
         Ok(Self(owners))
