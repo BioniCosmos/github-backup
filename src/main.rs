@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Sender},
     },
@@ -381,7 +381,7 @@ Date:   {date}\n"
         0 => {
             let http = ctx.http();
             let repos = ctx.remote().query_by_name(repo_name);
-            let latest_commits = Task::scope(|scope| {
+            let latest_commits = Task::scope(repos.len().min(8), |scope| {
                 for repo in &repos {
                     scope.run(|| {
                         Ok(http
@@ -574,41 +574,83 @@ impl<T> SharedPtr<T> {
 unsafe impl<T> Sync for SharedPtr<T> {}
 
 struct Task<'scope, T: 'scope> {
-    tx: Sender<Box<dyn FnOnce() -> Result<T> + 'scope + Send>>,
+    tx: Sender<TaskPayload<'scope, T>>,
+    i: AtomicUsize,
+}
+
+type TaskPayload<'scope, T> = (usize, Box<dyn FnOnce() -> Result<T> + Send + 'scope>);
+
+struct TaskResult<T>(usize, T);
+
+impl<T> Eq for TaskResult<T> {}
+
+impl<T> Ord for TaskResult<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+
+impl<T> PartialOrd for TaskResult<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> PartialEq for TaskResult<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
 }
 
 impl<'scope, T: Send> Task<'scope, T> {
-    fn scope(f: impl for<'s> FnOnce(&'s Self)) -> Result<Vec<T>> {
-        let (tx, rx) = mpsc::channel();
-        let task_scope = Self { tx };
+    fn scope(n: usize, f: impl for<'s> FnOnce(&'s Self)) -> Result<Vec<T>> {
+        let (tx, rx) = mpsc::channel::<TaskPayload<T>>();
+        let rx = Mutex::new(rx);
         let err = OnceLock::new();
+        let results = Mutex::new(vec![]);
+
         thread::scope(|scope| {
-            let rx_worker = scope.spawn(|| {
-                rx.into_iter()
-                    .map(|task| {
-                        scope.spawn(|| {
-                            if err.get().is_some() {
-                                return Err(anyhow!(""));
-                            }
-                            task().inspect_err(|_| _ = err.set(()))
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let mut workers = vec![];
+            for _ in 0..n {
+                workers.push(scope.spawn(|| {
+                    loop {
+                        let Ok((i, task)) = rx.lock().unwrap().recv() else {
+                            return;
+                        };
+                        if err.get().is_some() {
+                            return;
+                        }
+                        match task() {
+                            Ok(result) => results.lock().unwrap().push(TaskResult(i, result)),
+                            Err(e) => _ = err.set(e),
+                        }
+                    }
+                }));
+            }
+
+            let task_scope = Self {
+                tx,
+                i: AtomicUsize::new(0),
+            };
             f(&task_scope);
             drop(task_scope.tx);
-            rx_worker
-                .join()
-                .unwrap()
-                .into_iter()
-                .map(|task| task.join().unwrap())
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .collect()
+
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+
+        if let Some(e) = err.into_inner() {
+            return Err(e);
+        }
+        let mut results = results.into_inner().unwrap();
+        results.sort();
+        Ok(results.into_iter().map(|x| x.1).collect())
     }
 
-    fn run(&self, f: impl FnOnce() -> Result<T> + 'scope + Send) {
-        self.tx.send(Box::new(f)).unwrap();
+    fn run(&self, f: impl FnOnce() -> Result<T> + Send + 'scope) {
+        self.tx
+            .send((self.i.fetch_add(1, Ordering::Relaxed), Box::new(f)))
+            .unwrap();
     }
 }
