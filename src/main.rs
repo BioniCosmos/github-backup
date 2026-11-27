@@ -454,15 +454,30 @@ struct Remote(HashMap<String, HashMap<String, RemoteRepo>>);
 
 impl Remote {
     fn new(http: &Agent, token: &str) -> Result<Self> {
-        let mut repos = vec![];
-        let mut url = "https://api.github.com/user/repos";
-        let mut res;
-        while !url.is_empty() {
-            res = http.get(url).call()?;
-            repos.append(&mut res.body_mut().read_json()?);
-            url = Self::next_page(res.headers().get("link"));
+        let get_user_repos = |page: usize| {
+            move || {
+                let mut res = http
+                    .get("https://api.github.com/user/repos")
+                    .query("per_page", "100")
+                    .query("page", page.to_string())
+                    .call()?;
+                Ok((
+                    res.body_mut().read_json::<Vec<RemoteRepo>>()?,
+                    Self::get_last_page(res.headers().get("link")),
+                ))
+            }
+        };
+
+        let (mut repos, last_page) = get_user_repos(1)()?;
+        if last_page > 1 {
+            let result = Task::scope((last_page - 1).min(8), |scope| {
+                for page in 2..=last_page {
+                    scope.run(get_user_repos(page));
+                }
+            })?;
+            repos.extend(result.into_iter().flat_map(|(repos, _)| repos));
         }
-        Self::add_user_info_to_url(http, token, &mut repos)?;
+        Self::add_user_info_to_url(token, &mut repos)?;
 
         let mut owners = HashMap::new();
         for repo in repos {
@@ -485,36 +500,32 @@ impl Remote {
         self.0.values().flat_map(|owner| owner.values()).collect()
     }
 
-    fn next_page(raw: Option<&HeaderValue>) -> &str {
-        if let Some(raw) = raw
-            && let Ok(raw) = raw.to_str()
+    fn get_last_page(link: Option<&HeaderValue>) -> usize {
+        if let Some(link) = link
+            && let Ok(link) = link.to_str()
         {
-            for item in raw.split(", ") {
+            for item in link.split(", ") {
                 let mut item = item.split("; ");
                 let url = item.next().map(|url| &url[1..url.len() - 1]);
                 let rel = item.next().map(|rel| &rel[5..rel.len() - 1]);
                 if let Some(url) = url
                     && let Some(rel) = rel
-                    && rel == "next"
+                    && rel == "last"
+                    && let Some(page) = url.split("page=").last()
+                    && let Ok(page) = page.parse()
                 {
-                    return url;
+                    return page;
                 }
             }
         }
-        ""
+        0
     }
 
-    fn add_user_info_to_url(http: &Agent, token: &str, repos: &mut Vec<RemoteRepo>) -> Result<()> {
-        let user = http
-            .get("https://api.github.com/user")
-            .call()?
-            .body_mut()
-            .read_json::<User>()?;
+    fn add_user_info_to_url(token: &str, repos: &mut Vec<RemoteRepo>) -> Result<()> {
         for repo in repos {
             let mut parts = Uri::try_from(&repo.clone_url)?.into_parts();
             parts.authority = Some(Authority::try_from(format!(
-                "{}:{token}@{}",
-                user.login,
+                "_:{token}@{}",
                 parts.authority.with_context(|| format!(
                     "no authority component in `clone_url`: {}",
                     repo.clone_url,
