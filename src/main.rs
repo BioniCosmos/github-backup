@@ -4,6 +4,7 @@ use std::{
     env,
     fmt::Debug,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -14,7 +15,7 @@ use std::{
     thread,
 };
 
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use anyhow::{Context as _, Error, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Deserializer};
 use ureq::{
     Agent, SendBody,
@@ -176,7 +177,7 @@ fn backup(ctx: &Context) -> Result<()> {
         {
             scope.run(move || {
                 let repo_path = base_dir.join(format!("{full_name}.git"));
-                let is_new = local.query_by_full_name(owner, name).is_some();
+                let is_new = local.query_by_full_name(owner, name).is_none();
 
                 let mut command = Command::new("git");
                 if is_new {
@@ -197,7 +198,7 @@ fn backup(ctx: &Context) -> Result<()> {
                     format!("failed to spawn `git` when backing up `{full_name}`")
                 })?;
                 ensure!(
-                    output.status.success() && output.stderr.is_empty(),
+                    output.status.success(),
                     "failed to back up `{full_name}`\n  {}\n  stderr:\n{}",
                     output.status,
                     indent(String::from_utf8_lossy_owned(output.stderr).trim(), "    "),
@@ -394,7 +395,12 @@ struct LocalRepo {
 impl Local {
     fn new(base_dir: &Path) -> Result<Self> {
         let mut repos = HashMap::new();
-        for owner in fs::read_dir(base_dir)? {
+        let base_dir = match fs::read_dir(base_dir) {
+            Ok(x) => x,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Self(HashMap::new())),
+            Err(e) => return Err(Error::new(e)),
+        };
+        for owner in base_dir {
             let owner = owner?;
             let owner_name = owner
                 .file_name()
