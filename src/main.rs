@@ -58,11 +58,7 @@ impl Context {
 
     fn http(&self) -> &Agent {
         self.http.get_or_init(|| {
-            let mut headers = HeaderMap::with_capacity(3);
-            headers.insert(
-                header::ACCEPT,
-                HeaderValue::from_static("application/vnd.github+json"),
-            );
+            let mut headers = HeaderMap::with_capacity(2);
             headers.insert(
                 header::AUTHORIZATION,
                 HeaderValue::try_from(format!("Bearer {}", self.token())).expect("invalid token"),
@@ -74,6 +70,7 @@ impl Context {
             Agent::new_with_config(
                 Config::builder()
                     .user_agent("github-backup")
+                    .accept("application/vnd.github+json")
                     .middleware(move |mut req: Request<SendBody>, next: MiddlewareNext| {
                         *req.headers_mut() = headers.clone();
                         next.handle(req)
