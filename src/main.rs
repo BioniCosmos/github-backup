@@ -16,11 +16,12 @@ use std::{
 };
 
 use anyhow::{Context as _, Error, Result, anyhow, bail, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Deserializer};
 use ureq::{
     Agent, SendBody,
     config::Config,
-    http::{HeaderMap, HeaderValue, Request, Uri, header, uri::Authority},
+    http::{HeaderMap, HeaderValue, Request, header},
     middleware::MiddlewareNext,
 };
 
@@ -51,9 +52,8 @@ impl Context {
     }
 
     fn remote(&self) -> &Remote {
-        self.remote.get_or_init(|| {
-            Remote::new(self.http(), self.token()).expect("failed to initialize `remote`")
-        })
+        self.remote
+            .get_or_init(|| Remote::new(self.http()).expect("failed to initialize `remote`"))
     }
 
     fn http(&self) -> &Agent {
@@ -157,6 +157,7 @@ where
 
 fn backup(ctx: &Context) -> Result<()> {
     let base_dir = ctx.base_dir();
+    let token = ctx.token();
     let local = ctx.local();
 
     for owner in ctx.remote().0.keys() {
@@ -181,6 +182,11 @@ fn backup(ctx: &Context) -> Result<()> {
                     command
                         .arg("clone")
                         .arg("--mirror")
+                        .arg("-c")
+                        .arg(format!(
+                            "http.https://github.com/.extraHeader=Authorization: Basic {}",
+                            STANDARD.encode(token),
+                        ))
                         .arg(clone_url)
                         .arg(&repo_path);
                 } else {
@@ -456,7 +462,7 @@ impl Local {
 struct Remote(HashMap<String, HashMap<String, RemoteRepo>>);
 
 impl Remote {
-    fn new(http: &Agent, token: &str) -> Result<Self> {
+    fn new(http: &Agent) -> Result<Self> {
         let get_user_repos = |page: usize| {
             move || {
                 let mut res = http
@@ -480,7 +486,6 @@ impl Remote {
             })?;
             repos.extend(result.into_iter().flat_map(|(repos, _)| repos));
         }
-        Self::add_user_info_to_url(token, &mut repos)?;
 
         let mut owners = HashMap::new();
         for repo in repos {
@@ -522,21 +527,6 @@ impl Remote {
             }
         }
         0
-    }
-
-    fn add_user_info_to_url(token: &str, repos: &mut Vec<RemoteRepo>) -> Result<()> {
-        for repo in repos {
-            let mut parts = Uri::try_from(&repo.clone_url)?.into_parts();
-            parts.authority = Some(Authority::try_from(format!(
-                "_:{token}@{}",
-                parts.authority.with_context(|| format!(
-                    "no authority component in `clone_url`: {}",
-                    repo.clone_url,
-                ))?,
-            ))?);
-            repo.clone_url = Uri::from_parts(parts)?.to_string();
-        }
-        Ok(())
     }
 }
 
