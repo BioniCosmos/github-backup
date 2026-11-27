@@ -8,13 +8,13 @@ use std::{
     process::Command,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Sender},
     },
     thread,
 };
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Deserializer};
 use ureq::{
     Agent, SendBody,
@@ -166,54 +166,46 @@ fn backup(ctx: &Context) -> Result<()> {
     }
 
     let repos = ctx.remote().flat();
-    let has_err = AtomicBool::new(false);
-    let i = AtomicUsize::new(0);
-    thread::scope(|scope| {
-        for _ in 0..16 {
-            scope.spawn(|| {
-                while !has_err.load(Ordering::Relaxed)
-                    && let Some(RemoteRepo {
-                        name,
-                        full_name,
-                        owner,
-                        clone_url,
-                    }) = repos.get(i.fetch_add(1, Ordering::Relaxed))
-                {
-                    let repo_path = base_dir.join(format!("{full_name}.git"));
+    Task::scope(repos.len().min(8), |scope| {
+        for RemoteRepo {
+            name,
+            full_name,
+            owner,
+            clone_url,
+        } in repos
+        {
+            scope.run(move || {
+                let repo_path = base_dir.join(format!("{full_name}.git"));
+                let is_new = local.query_by_full_name(owner, name).is_some();
 
-                    let is_new = local.query_by_full_name(owner, name).is_some();
-                    let mut command = Command::new("git");
-                    if let Err(e) = if is_new {
-                        command
-                            .arg("clone")
-                            .arg("--mirror")
-                            .arg(clone_url)
-                            .current_dir(base_dir.join(owner))
-                    } else {
-                        command
-                            .arg("remote")
-                            .arg("update")
-                            .arg("--prune")
-                            .current_dir(&repo_path)
-                    }
-                    .output()
-                    .map_err(anyhow::Error::new)
-                    .and_then(|output| match output.status.success() {
-                        true => Ok(()),
-                        false => Err(anyhow!(
-                            String::try_from(output.stderr)
-                                .expect("unexpected invalid stderr")
-                                .trim()
-                                .to_owned()
-                        )),
-                    }) {
-                        has_err.store(true, Ordering::Relaxed);
-                        eprintln!("Error when fetching {}: {e}", full_name);
-                    }
+                let mut command = Command::new("git");
+                if is_new {
+                    command
+                        .arg("clone")
+                        .arg("--mirror")
+                        .arg(clone_url)
+                        .arg(&repo_path);
+                } else {
+                    command
+                        .arg("remote")
+                        .arg("update")
+                        .arg("--prune")
+                        .current_dir(&repo_path);
                 }
+
+                let output = command.output().with_context(|| {
+                    format!("failed to spawn `git` when backing up `{full_name}`")
+                })?;
+                ensure!(
+                    output.status.success() && output.stderr.is_empty(),
+                    "failed to back up `{full_name}`\n  {}\n  stderr:\n{}",
+                    output.status,
+                    indent(String::from_utf8_lossy_owned(output.stderr).trim(), "    "),
+                );
+                Ok(())
             });
         }
-    });
+    })?;
 
     for (owner, repos) in &local.0 {
         if !ctx.remote().0.contains_key(owner) {
@@ -236,32 +228,28 @@ fn list_repo(ctx: &Context, repo_name: &str) -> Result<()> {
     match parts.len() {
         2 => {
             let Some(repo) = ctx.local().query_by_full_name(parts[0], parts[1]) else {
-                return Err(anyhow!("`{repo_name}` not found"));
+                bail!("`{repo_name}` not found");
             };
             let output = Command::new("git")
                 .current_dir(&repo.path)
                 .arg("log")
                 .arg("-1")
                 .output()?;
-            if !output.stderr.is_empty() {
-                return Err(anyhow!(
-                    "Encounter error on `git` when listing `{repo_name}`: {}",
-                    String::from_utf8_lossy_owned(output.stderr),
-                ));
-            }
-            if !output.status.success() {
-                return Err(anyhow!(
-                    "Encounter error on `git` when listing `{repo_name}`: `git` exited unexpectedly with {}",
-                    output.status,
-                ));
-            }
+            ensure!(
+                output.stderr.is_empty(),
+                "Encounter error on `git` when listing `{repo_name}`: {}",
+                String::from_utf8_lossy_owned(output.stderr),
+            );
+            ensure!(
+                output.status.success(),
+                "Encounter error on `git` when listing `{repo_name}`: `git` exited unexpectedly with {}",
+                output.status,
+            );
             print!("{}", String::from_utf8_lossy_owned(output.stdout));
         }
         1 => {
             let repos = ctx.local().query_by_name(repo_name);
-            if repos.is_empty() {
-                return Err(anyhow!("`{repo_name}` not found"));
-            }
+            ensure!(!repos.is_empty(), "`{repo_name}` not found");
             for repo in repos {
                 let output = Command::new("git")
                     .current_dir(&repo.path)
@@ -269,18 +257,16 @@ fn list_repo(ctx: &Context, repo_name: &str) -> Result<()> {
                     .arg("-1")
                     .arg("--pretty=[%h] %an; %ar: %s")
                     .output()?;
-                if !output.stderr.is_empty() {
-                    return Err(anyhow!(
-                        "Encounter error on `git` when listing `{repo_name}`: {}",
-                        String::from_utf8_lossy_owned(output.stderr),
-                    ));
-                }
-                if !output.status.success() {
-                    return Err(anyhow!(
-                        "Encounter error on `git` when listing `{repo_name}`: `git` exited unexpectedly with {}",
-                        output.status,
-                    ));
-                }
+                ensure!(
+                    output.stderr.is_empty(),
+                    "Encounter error on `git` when listing `{repo_name}`: {}",
+                    String::from_utf8_lossy_owned(output.stderr),
+                );
+                ensure!(
+                    output.status.success(),
+                    "Encounter error on `git` when listing `{repo_name}`: `git` exited unexpectedly with {}",
+                    output.status,
+                );
                 print!(
                     "{} {}",
                     repo.full_name,
@@ -288,62 +274,39 @@ fn list_repo(ctx: &Context, repo_name: &str) -> Result<()> {
                 );
             }
         }
-        _ => return Err(anyhow!("invalid repository name: `{repo_name}`")),
+        _ => bail!("invalid repository name: `{repo_name}`"),
     }
     Ok(())
 }
 
 fn list_all_repos(ctx: &Context) -> Result<()> {
     let repos = ctx.local().flat_sorted();
-    let has_err = AtomicBool::default();
-    let i = AtomicUsize::default();
-    let mut result_data = vec![String::new(); repos.len()];
-    let result = SharedPtr(result_data.as_mut_ptr());
-    thread::scope(|scope| {
-        for _ in 0..16 {
-            scope.spawn(|| loop {
-                let i = i.fetch_add(1, Ordering::Relaxed);
-                if i >= repos.len() || has_err.load(Ordering::Relaxed) {
-                    return;
-                }
-                let repo = repos[i];
+    let result = Task::scope(repos.len().min(8), |scope| {
+        for repo in repos {
+            scope.run(|| {
                 let output = Command::new("git")
                     .current_dir(&repo.path)
                     .arg("log")
                     .arg("-1")
                     .arg("--pretty=[%h] %an; %ar: %s")
-                    .output()
-                    .unwrap();
-                if !output.stderr.is_empty() {
-                    has_err.store(true, Ordering::Relaxed);
-                    eprintln!(
-                        "Encounter error on `git` when listing `{}`: {}",
-                        String::from_utf8_lossy_owned(output.stderr),
-                        repo.full_name,
-                    );
-                    return;
-                }
-                if !output.status.success() {
-                    has_err.store(true, Ordering::Relaxed);
-                    eprintln!(
-                        "Encounter error on `git` when listing `{}`: `git` exited unexpectedly with {}",
-                        repo.full_name,
-                        output.status,
-                    );
-                    return;
-                }
-                unsafe {
-                    *result.get().add(i) = format!(
-                        "{} {}",
-                        repo.full_name,
-                        String::from_utf8_lossy_owned(output.stdout),
-                    );
-                }
+                    .output()?;
+                ensure!(
+                    output.status.success() && output.stderr.is_empty(),
+                    "failed to list `{}`\n  {}\n  stderr:\n{}",
+                    repo.full_name,
+                    output.status,
+                    indent(String::from_utf8_lossy_owned(output.stderr).trim(), "    "),
+                );
+                Ok(format!(
+                    "{} {}",
+                    repo.full_name,
+                    String::from_utf8_lossy_owned(output.stdout),
+                ))
             });
         }
-    });
-    for result in result_data {
-        print!("{result}");
+    })?;
+    for repo_info in result {
+        print!("{repo_info}");
     }
     Ok(())
 }
@@ -563,16 +526,6 @@ impl Remote {
     }
 }
 
-struct SharedPtr<T>(*mut T);
-
-impl<T> SharedPtr<T> {
-    fn get(&self) -> *mut T {
-        self.0
-    }
-}
-
-unsafe impl<T> Sync for SharedPtr<T> {}
-
 struct Task<'scope, T: 'scope> {
     tx: Sender<TaskPayload<'scope, T>>,
     i: AtomicUsize,
@@ -653,4 +606,11 @@ impl<'scope, T: Send> Task<'scope, T> {
             .send((self.i.fetch_add(1, Ordering::Relaxed), Box::new(f)))
             .unwrap();
     }
+}
+
+fn indent(s: &str, prefix: &str) -> String {
+    s.lines()
+        .map(|line| format!("{prefix}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
