@@ -1,14 +1,14 @@
 use std::{
-    cell::OnceCell,
+    cell::{LazyCell, OnceCell},
     collections::HashMap,
     env,
     fmt::Debug,
-    fs,
-    io::ErrorKind,
+    fs::{self, File},
+    io::{BufRead, BufReader, ErrorKind, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
         mpsc::{self, Sender},
     },
@@ -16,18 +16,22 @@ use std::{
 };
 
 use anyhow::{Context as _, Error, Result, anyhow, bail, ensure};
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use serde::{Deserialize, Deserializer};
 use ureq::{
-    Agent, SendBody,
+    Agent, Body, SendBody,
     config::Config,
-    http::{HeaderMap, HeaderValue, Request, header},
+    http::{HeaderMap, HeaderValue, Request, Response, StatusCode, header},
     middleware::MiddlewareNext,
 };
 
 #[derive(Default)]
 struct Context {
     base_dir: OnceCell<PathBuf>,
+    cache_dir: LazyCell<Arc<PathBuf>>,
     token: OnceCell<String>,
     local: OnceCell<Local>,
     remote: OnceCell<Remote>,
@@ -35,6 +39,19 @@ struct Context {
 }
 
 impl Context {
+    fn new() -> Self {
+        Self {
+            cache_dir: LazyCell::new(|| {
+                let cache_dir = PathBuf::from(
+                    dotenvy::var("CACHE_DIRECTORY").unwrap_or_else(|_| String::from("cache")),
+                );
+                fs::create_dir_all(&cache_dir).expect("failed to create the cache directory");
+                Arc::new(cache_dir)
+            }),
+            ..Default::default()
+        }
+    }
+
     fn base_dir(&self) -> &Path {
         self.base_dir.get_or_init(|| {
             PathBuf::from(dotenvy::var("STATE_DIRECTORY").unwrap_or_default()).join("repos")
@@ -67,13 +84,66 @@ impl Context {
                 "X-GitHub-Api-Version",
                 HeaderValue::from_static("2026-03-10"),
             );
+            let cache_dir = self.cache_dir.clone();
+            let no_cache_err =
+                "The HTTP request returned `304 Not Modified`, but the cache body read failed.";
+
             Agent::new_with_config(
                 Config::builder()
                     .user_agent("github-backup")
                     .accept("application/vnd.github+json")
                     .middleware(move |mut req: Request<SendBody>, next: MiddlewareNext| {
                         *req.headers_mut() = headers.clone();
-                        next.handle(req)
+
+                        let cache_path = cache_dir.join(
+                            URL_SAFE_NO_PAD.encode(req.uri().path_and_query().unwrap().as_str()),
+                        );
+                        let cache_body = File::open(&cache_path).ok().and_then(|cache| {
+                            let file = BufReader::new(cache);
+                            let mut lines = file.lines();
+                            if let Some(Ok(etag)) = lines.next()
+                                && let Ok(etag) = HeaderValue::try_from(etag)
+                                && let Some(Ok(cache_body)) = lines.next()
+                            {
+                                req.headers_mut().insert(header::IF_NONE_MATCH, etag);
+                                Some(cache_body)
+                            } else {
+                                None
+                            }
+                        });
+                        let res = next.handle(req)?;
+
+                        if res.status() == StatusCode::NOT_MODIFIED {
+                            return if let Some(cache_body) = cache_body {
+                                Ok(Response::builder().body(Body::builder().data(cache_body))?)
+                            } else {
+                                Err(ureq::Error::Other(
+                                    anyhow!(no_cache_err).into_boxed_dyn_error(),
+                                ))
+                            };
+                        }
+
+                        let (Some(etag), Ok(mut cache)) = (
+                            res.headers().get(header::ETAG).cloned(),
+                            File::create(cache_path),
+                        ) else {
+                            return Ok(res);
+                        };
+                        let (parts, mut body) = res.into_parts();
+                        let data = body.read_to_vec()?;
+                        _ = cache
+                            .write_all(etag.as_bytes())
+                            .and_then(|_| cache.write_all(b"\n"))
+                            .and_then(|_| cache.write_all(&data));
+
+                        let mut body_builder = Body::builder();
+                        if let Some(mime_type) = body.mime_type() {
+                            body_builder = body_builder.mime_type(mime_type);
+                        }
+                        if let Some(charset) = body.charset() {
+                            body_builder = body_builder.charset(charset);
+                        }
+                        Ok(Response::from_parts(parts, body_builder.data(data)))
                     })
                     .build(),
             )
@@ -91,7 +161,7 @@ If there are no arguments, a backup operation will be performed.
   -h, --help                                         print this help message");
 
 fn main() -> Result<()> {
-    let ctx = Context::default();
+    let ctx = Context::new();
     let args = env::args().collect::<Vec<_>>();
     if args.len() > 1 {
         match args[1].as_str() {
